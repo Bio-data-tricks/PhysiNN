@@ -11,3 +11,23 @@ This repository contains a modular implementation of a physics-informed auto-enc
 - `callbacks.py`, `training.py`, `evaluation.py`: orchestration helpers for training workflows.
 
 The `train.py` script demonstrates how to assemble the end-to-end training pipeline using these components.
+
+## Training stages
+
+The training entry point now accepts staged execution. By default it trains only the "A" stage, but you can run the full pipeline (stage A, combined stage B, and a global fine-tuning pass) by specifying the stages to execute:
+
+```bash
+python train.py --stages A B FT
+```
+
+Additional options allow you to change the root directory for run artefacts (`--runs-base`) and the number of validation samples visualised during training (`--eval-samples`).
+
+## Data generation example
+
+An end-to-end example for dataset synthesis and visualisation is provided under `examples/data_generation.py`. It lets you choose the normalisation preset, generate synthetic spectra, and export both the spectral samples and corresponding parameters as Pandas DataFrames:
+
+```bash
+python examples/data_generation.py --samples 128 --normalization train_wide --output-dir ./my_demo
+```
+
+The script saves CSV files containing the spectra (`spectra.csv`) and parameters (`parameters.csv`), alongside illustrative plots. Use `--show` to display the figures interactively.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Optional
 
 import pytorch_lightning as pl
@@ -119,7 +120,7 @@ def train_stage_custom(
     return model
 
 
-def train_stage_A(model, train_loader, val_loader, **kwargs):
+def train_A(model, train_loader, val_loader, **kwargs):
     defaults = dict(
         stage_name="A",
         epochs=20,
@@ -138,6 +139,9 @@ def train_stage_A(model, train_loader, val_loader, **kwargs):
     )
     defaults.update(kwargs)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
+
+
+train_stage_A = train_A
 
 
 def train_stage_B1(model, train_loader, val_loader, **kwargs):
@@ -175,6 +179,88 @@ def train_stage_B2(model, train_loader, val_loader, **kwargs):
         delta_scale=0.08,
         use_film=True,
         film_subset=["P", "T"],
+        heads_subset=None,
+        enable_progress_bar=False,
+    )
+    defaults.update(kwargs)
+    return train_stage_custom(model, train_loader, val_loader, **defaults)
+
+
+def train_B(
+    model,
+    train_loader,
+    val_loader,
+    *,
+    ckpt_in: str | Path | None = None,
+    ckpt_dir: str | Path | None = None,
+    callbacks=None,
+    callbacks_b1=None,
+    callbacks_b2=None,
+    stage_b1_kwargs: Optional[dict] = None,
+    stage_b2_kwargs: Optional[dict] = None,
+    **trainer_kwargs,
+):
+    """Run stage B training (B1 then B2) with convenient defaults.
+
+    Parameters can be customised independently for the two stages through
+    ``stage_b1_kwargs`` and ``stage_b2_kwargs``. Callbacks passed via
+    ``callbacks`` are shared by default, but they can be overridden for each
+    stage using ``callbacks_b1``/``callbacks_b2``.
+    """
+
+    ckpt_path = Path(ckpt_dir).expanduser().resolve() if ckpt_dir else None
+    if ckpt_path is not None:
+        ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    b1_kwargs = dict(stage_b1_kwargs or {})
+    b2_kwargs = dict(stage_b2_kwargs or {})
+
+    if callbacks_b1 is None:
+        callbacks_b1 = callbacks
+    if callbacks_b2 is None:
+        callbacks_b2 = callbacks
+
+    if callbacks_b1 is not None and "callbacks" not in b1_kwargs:
+        b1_kwargs["callbacks"] = callbacks_b1
+    if callbacks_b2 is not None and "callbacks" not in b2_kwargs:
+        b2_kwargs["callbacks"] = callbacks_b2
+
+    if ckpt_in is not None and "ckpt_in" not in b1_kwargs:
+        b1_kwargs["ckpt_in"] = str(ckpt_in)
+
+    if ckpt_path is not None and "ckpt_out" not in b1_kwargs:
+        b1_kwargs["ckpt_out"] = str(ckpt_path / "stage_B1.ckpt")
+
+    model = train_stage_B1(model, train_loader, val_loader, **trainer_kwargs, **b1_kwargs)
+
+    if ckpt_path is not None and "ckpt_out" not in b2_kwargs:
+        b2_kwargs["ckpt_out"] = str(ckpt_path / "stage_B2.ckpt")
+
+    if "ckpt_in" not in b2_kwargs and "ckpt_out" in b1_kwargs:
+        b2_kwargs["ckpt_in"] = b1_kwargs["ckpt_out"]
+
+    return train_stage_B2(model, train_loader, val_loader, **trainer_kwargs, **b2_kwargs)
+
+
+train_stage_B = train_B
+
+
+def fine_tune_global(model, train_loader, val_loader, **kwargs):
+    """Perform a short global fine-tuning stage."""
+
+    defaults = dict(
+        stage_name="FT",
+        epochs=8,
+        base_lr=5e-6,
+        refiner_lr=5e-6,
+        train_base=True,
+        train_heads=True,
+        train_film=True,
+        train_refiner=True,
+        refine_steps=1,
+        delta_scale=0.05,
+        use_film=True,
+        film_subset=None,
         heads_subset=None,
         enable_progress_bar=False,
     )

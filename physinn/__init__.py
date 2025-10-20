@@ -11,6 +11,7 @@ from .normalization import norm_param_value, norm_param_torch, unnorm_param_torc
 from .datasets import SpectraDataset
 from .models.module import PhysicallyInformedAE
 from .builders import build_data_and_model
+from .training import fine_tune_global, train_A, train_B
 
 __all__ = [
     "PARAMS",
@@ -24,4 +25,7 @@ __all__ = [
     "SpectraDataset",
     "PhysicallyInformedAE",
     "build_data_and_model",
+    "train_A",
+    "train_B",
+    "fine_tune_global",
 ]
