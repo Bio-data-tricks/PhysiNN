@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
+
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    yaml = None
 
 from physinn.config import LOG_FLOOR, NORMALIZATION, PARAMS
 from physinn.datasets import SpectraDataset
@@ -20,21 +24,37 @@ from physinn.physics.spectra import parse_csv_transitions
 from physinn.physics.qtpy import Tips2021QTpy
 from physinn.ranges import expand_interval, map_ranges
 
+try:  # pragma: no cover - import flexibility for script execution
+    from .visualization import plot_param_hist, plot_spectra_example
+except ImportError:  # pragma: no cover
+    from visualization import plot_param_hist, plot_spectra_example
 
-POLY_FREQ_CH4 = [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
-TRANSITIONS_CH4 = """6;1;3085.861015;1.013E-19;0.06;0.078;219.9411;0.73;-0.00712;0.0;0.0221;0.96;0.584;1.12
-6;1;3085.832038;1.693E-19;0.0597;0.078;219.9451;0.73;-0.00712;0.0;0.0222;0.91;0.173;1.11
-6;1;3085.893769;1.011E-19;0.0602;0.078;219.9366;0.73;-0.00711;0.0;0.0184;1.14;-0.516;1.37
-6;1;3086.030985;1.659E-19;0.0595;0.078;219.9197;0.73;-0.00711;0.0;0.0193;1.17;-0.204;0.97
-6;1;3086.071879;1.000E-19;0.0585;0.078;219.9149;0.73;-0.00703;0.0;0.0232;1.09;-0.0689;0.82
-6;1;3086.085994;6.671E-20;0.055;0.078;219.9133;0.70;-0.00610;0.0;0.0300;0.54;0.00;0.0"""
-TRANSITIONS_H2O = """1;2;3083.831748;2.874e-24;0.0971;0.460;78.9886;0.87;-0.00653
-1;1;3085.357520;9.562e-25;0.0452;0.282;2254.2838;0.51;0.001433
-1;1;3085.506609;1.396e-25;0.0662;0.344;2927.9412;0.63;0.00324
-1;1;3085.558839;3.186e-25;0.0491;0.293;2254.2844;0.82;-0.00464
-1;1;3085.689600;3.912e-25;0.0508;0.333;2612.7999;0.64;-0.00649
-1;1;3086.133208;2.369e-25;0.0457;0.272;2414.7234;0.44;-0.00591
-1;1;3087.192118;2.070e-22;0.0768;0.413;648.9787;0.60;-0.00803"""
+
+DEFAULT_CONFIG = Path(__file__).with_name("config").joinpath("spectra_config.yaml")
+
+
+def _load_spectra_config(config_file: Path | None) -> dict:
+    path = config_file or DEFAULT_CONFIG
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Fichier de configuration YAML introuvable : '{path}'."
+        )
+    with open(path, "r", encoding="utf8") as handle:
+        text = handle.read()
+    config = _safe_load_yaml(text)
+    if not isinstance(config, dict):
+        raise ValueError("Le fichier de configuration doit contenir un dictionnaire YAML.")
+    return config
+
+
+def _extract_poly_coeff(config: Mapping[str, Mapping[str, Iterable[float]]], key: str) -> Iterable[float]:
+    poly_cfg = config.get("poly_freq", {})
+    if key not in poly_cfg:
+        raise KeyError(f"Coefficient de polynôme '{key}' introuvable dans la configuration YAML.")
+    coeffs = poly_cfg[key]
+    if isinstance(coeffs, str) or not isinstance(coeffs, Iterable):
+        raise TypeError(f"Les coefficients '{key}' doivent être une liste de nombres.")
+    return [float(value) for value in coeffs]
 
 _BASE_NORMALISATION = {
     "sig0": (3085.43, 3085.46),
@@ -88,8 +108,12 @@ class ConstantTips:
 
 def _load_normalisation(preset: str, custom_file: Path | None) -> Dict[str, tuple[float, float]]:
     if custom_file is not None:
-        with open(custom_file, "r") as handle:
-            data = json.load(handle)
+        with open(custom_file, "r", encoding="utf8") as handle:
+            text = handle.read()
+        if yaml is not None:
+            data = yaml.safe_load(text)
+        else:
+            data = json.loads(text)
         normalisation = {k: (float(v[0]), float(v[1])) for k, v in data.items()}
     else:
         key = preset.lower()
@@ -114,11 +138,78 @@ def _load_tipspy(path: Path | None) -> Tips2021QTpy | ConstantTips:
         return ConstantTips()
 
 
-def _build_transitions() -> Dict[str, Iterable]:
-    return {
-        "CH4": parse_csv_transitions(TRANSITIONS_CH4),
-        "H2O": parse_csv_transitions(TRANSITIONS_H2O),
-    }
+def _build_transitions(config: Mapping[str, Mapping[str, str]]) -> Dict[str, Iterable]:
+    transitions_cfg = config.get("transitions", {})
+    if not transitions_cfg:
+        raise ValueError("Aucune transition définie dans la configuration YAML.")
+    transitions: Dict[str, Iterable] = {}
+    for species, csv_text in transitions_cfg.items():
+        if not isinstance(csv_text, str):
+            raise TypeError(f"Les transitions pour '{species}' doivent être une chaîne CSV.")
+        transitions[species] = parse_csv_transitions(csv_text)
+    return transitions
+
+
+def _safe_load_yaml(text: str) -> dict:
+    if yaml is not None:
+        return yaml.safe_load(text)
+
+    # Fallback minimal parser supporting the subset of YAML used in this project.
+    result: Dict[str, dict] = {}
+    current_section: str | None = None
+    current_key: str | None = None
+    block_key: str | None = None
+    block_lines: list[str] | None = None
+
+    def flush_block() -> None:
+        nonlocal block_lines, block_key
+        if block_lines is not None and block_key is not None and current_section is not None:
+            result.setdefault(current_section, {})[block_key] = "\n".join(block_lines)
+        block_lines = None
+        block_key = None
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        content = raw_line.strip()
+
+        if indent == 0:
+            flush_block()
+            if not content.endswith(":"):
+                raise ValueError(f"Ligne YAML invalide : '{raw_line}'.")
+            current_section = content[:-1]
+            result.setdefault(current_section, {})
+            current_key = None
+        elif current_section == "poly_freq":
+            if indent == 2 and content.endswith(":"):
+                flush_block()
+                current_key = content[:-1]
+                result.setdefault(current_section, {})[current_key] = []
+            elif indent >= 4 and content.startswith("- "):
+                if current_key is None:
+                    raise ValueError("Valeur de liste sans clé de molécule dans 'poly_freq'.")
+                value = float(content[2:])
+                result[current_section][current_key].append(value)
+            else:
+                raise ValueError(f"Structure YAML non prise en charge : '{raw_line}'.")
+        elif current_section == "transitions":
+            if indent == 2 and content.endswith(": |"):
+                flush_block()
+                block_key = content[:-3]
+                block_lines = []
+                result.setdefault(current_section, {})
+            elif indent >= 4:
+                if block_lines is None or block_key is None:
+                    raise ValueError("Bloc de texte inattendu dans 'transitions'.")
+                block_lines.append(content)
+            else:
+                raise ValueError(f"Structure YAML non prise en charge : '{raw_line}'.")
+        else:
+            raise ValueError(f"Section YAML '{current_section}' non prise en charge sans PyYAML.")
+
+    flush_block()
+    return result
 
 
 def _sample_dataset(dataset: SpectraDataset, n_samples: int) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -150,49 +241,16 @@ def _sample_dataset(dataset: SpectraDataset, n_samples: int) -> tuple[pd.DataFra
     return spectra_df, params_df
 
 
-def _plot_spectra_example(spectra_df: pd.DataFrame, output: Path) -> plt.Figure:
-    noisy = spectra_df["noisy"].iloc[0]
-    clean = spectra_df["clean"].iloc[0]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    x = range(len(noisy))
-    ax.plot(x, noisy.values, label="Spectre bruité", linewidth=1.2)
-    ax.plot(x, clean.values, label="Spectre propre", linewidth=1.2)
-    ax.set_xlabel("Indice de point spectral")
-    ax.set_ylabel("Transmission")
-    ax.set_title("Exemple de spectre simulé")
-    ax.legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(output, dpi=150)
-    return fig
-
-
-def _plot_param_hist(params_df: pd.DataFrame, output: Path) -> plt.Figure:
-    phys_df = params_df["phys"]
-    n_params = len(phys_df.columns)
-    n_cols = 3
-    n_rows = math.ceil(n_params / n_cols)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
-    if hasattr(axes, "flatten"):
-        flat_axes = axes.flatten()
-    else:
-        flat_axes = [axes]
-    for ax, name in zip(flat_axes, phys_df.columns):
-        ax.hist(phys_df[name], bins=20, color="#1f77b4", alpha=0.75)
-        ax.set_title(name)
-        ax.grid(alpha=0.3)
-    for ax in flat_axes[n_params:]:
-        ax.axis("off")
-    fig.suptitle("Distribution des paramètres physiques", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(output, dpi=150)
-    return fig
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Génération de données spectroscopiques PhysiNN")
     parser.add_argument("--samples", type=int, default=64, help="Nombre d'échantillons à générer pour les DataFrames")
     parser.add_argument("--dataset-size", type=int, default=512, help="Taille du dataset synthétique interne")
     parser.add_argument("--num-points", type=int, default=800, help="Nombre de points spectraux par exemple")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Chemin vers un fichier YAML contenant les transitions et paramètres spectraux",
+    )
     parser.add_argument(
         "--normalization",
         default="train_default",
@@ -201,7 +259,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalization-file",
         type=Path,
-        help="Chemin vers un fichier JSON personnalisé contenant les bornes de normalisation",
+        help="Chemin vers un fichier YAML ou JSON personnalisé contenant les bornes de normalisation",
     )
     parser.add_argument("--qtpy-dir", type=Path, default=Path("./QTpy"), help="Répertoire QTpy/TIPS 2021")
     parser.add_argument("--output-dir", type=Path, default=Path("./data_examples"), help="Répertoire de sortie")
@@ -227,8 +285,14 @@ def main() -> None:
     NORMALIZATION.clear()
     NORMALIZATION.update(normalisation)
 
+    try:
+        spectra_config = _load_spectra_config(args.config)
+        transitions = _build_transitions(spectra_config)
+        poly_freq_ch4 = _extract_poly_coeff(spectra_config, "CH4")
+    except (FileNotFoundError, ValueError, TypeError, KeyError) as exc:
+        raise SystemExit(str(exc))
+
     tipspy = _load_tipspy(args.qtpy_dir)
-    transitions = _build_transitions()
 
     noise_profile = None
     if not args.no_noise:
@@ -252,7 +316,7 @@ def main() -> None:
     dataset = SpectraDataset(
         n_samples=max(args.dataset_size, args.samples),
         num_points=args.num_points,
-        poly_freq_CH4=POLY_FREQ_CH4,
+        poly_freq_CH4=poly_freq_ch4,
         transitions_dict=transitions,
         sample_ranges=normalisation,
         strict_check=True,
@@ -270,8 +334,8 @@ def main() -> None:
     params_df.to_csv(params_path)
 
     figs: list[plt.Figure] = []
-    figs.append(_plot_spectra_example(spectra_df, output_dir / "spectra_example.png"))
-    figs.append(_plot_param_hist(params_df, output_dir / "parameters_hist.png"))
+    figs.append(plot_spectra_example(spectra_df, output_dir / "spectra_example.png"))
+    figs.append(plot_param_hist(params_df, output_dir / "parameters_hist.png"))
 
     print(f"✓ Données enregistrées : {spectra_path}")
     print(f"✓ Paramètres enregistrés : {params_path}")
